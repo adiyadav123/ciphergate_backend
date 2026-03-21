@@ -9,4 +9,4 @@ python-dotenv==1.2.2
 cryptography==44.0.1
 numpy==2.2.4
 opencv-python-headless==4.11.0.86
-httpx==0.27.2
+httpx==0.24
