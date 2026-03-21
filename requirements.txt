@@ -1,0 +1,11 @@
+fastapi==0.110.0
+uvicorn==0.27.1
+supabase==2.3.7
+bcrypt==4.1.2
+pyotp==2.9.0
+pydantic[email]==2.6.1
+python-multipart==0.0.9
+python-dotenv==1.2.2
+cryptography==44.0.1
+numpy==2.2.4
+opencv-python-headless==4.11.0.86
