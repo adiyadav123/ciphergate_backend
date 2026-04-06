@@ -6,6 +6,10 @@ import string
 import re
 import base64
 import binascii
+import time
+import pyotp
+import uuid
+from datetime import datetime, timezone
 from urllib.parse import quote, unquote, urlparse, parse_qs
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +19,8 @@ from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
 import auth_logic
 import dashboard_manager
+import google.generativeai as genai
+import json
 
 load_dotenv()
 
@@ -37,7 +43,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
 # --- MODELS ---
+class AICrackEstimateReq(BaseModel):
+    entropyBits: float
+    expectedGuesses: float
+
 class UserAuth(BaseModel):
     email: EmailStr
     password: str
@@ -68,6 +80,11 @@ class NoteReq(BaseModel):
     user_id: str
     content: str
 
+
+class NoteUpdateReq(BaseModel):
+    user_id: str
+    content: str
+
 class PassReq(BaseModel):
     user_id: str
     site_name: str
@@ -90,6 +107,14 @@ class UserScopeReq(BaseModel):
     user_id: str
 
 
+class ChatCreateReq(BaseModel):
+    user_id: str
+
+
+class ChatJoinReq(BaseModel):
+    user_id: str | None = None
+
+
 class PasswordGeneratorReq(BaseModel):
     base_string: str
     length: int = 16
@@ -102,6 +127,22 @@ class PasswordGeneratorReq(BaseModel):
 
 class QrDecodeReq(BaseModel):
     image_data: str
+
+
+class ChatSendReq(BaseModel):
+    user_id: str
+    session_id: str
+    content: str
+
+
+class ChatDeleteReq(BaseModel):
+    user_id: str
+    session_id: str
+
+
+class ChatLeaveReq(BaseModel):
+    user_id: str
+    session_id: str
 
 
 def _is_valid_totp_secret(secret: str | None) -> bool:
@@ -203,6 +244,62 @@ def _parse_otpauth_uri(uri: str):
         "secret_key": secret,
         "otpauth_uri": uri,
     }
+
+
+def _build_totp_payload(secret_key: str):
+    normalized = (secret_key or "").strip().replace(" ", "")
+    totp = pyotp.TOTP(normalized)
+    period = int(getattr(totp, "interval", 30) or 30)
+    current_ts = int(time.time())
+    remaining = period - (current_ts % period)
+    if remaining <= 0:
+        remaining = period
+
+    return {
+        "code": totp.now(),
+        "period": period,
+        "seconds_remaining": remaining,
+    }
+
+
+CHAT_ROOMS: dict[str, dict] = {}
+CHAT_STALE_SECONDS = 45
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _random_display_name() -> str:
+    adjectives = [
+        "Silent", "Neon", "Swift", "Bright", "Misty", "Calm", "Shadow", "Crimson", "Solar", "Icy",
+    ]
+    nouns = [
+        "Falcon", "Comet", "River", "Cipher", "Nova", "Fox", "Panda", "Eagle", "Wolf", "Otter",
+    ]
+    return f"{secrets.choice(adjectives)}{secrets.choice(nouns)}{secrets.randbelow(90) + 10}"
+
+
+def _get_room_or_404(room_id: str) -> dict:
+    room = CHAT_ROOMS.get(room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Chat room not found")
+    return room
+
+
+def _prune_stale_participants(room: dict):
+    now = time.time()
+    stale_ids = []
+    for sid, member in room["participants"].items():
+        if now - float(member.get("last_seen_ts", 0)) > CHAT_STALE_SECONDS:
+            stale_ids.append(sid)
+    for sid in stale_ids:
+        room["participants"].pop(sid, None)
+
+
+def _active_count(room: dict) -> int:
+    _prune_stale_participants(room)
+    return len(room["participants"])
 
 # --- AUTH ROUTES ---
 @app.post("/auth/register")
@@ -421,6 +518,18 @@ async def del_note(id: str):
     supabase.table("sticky_notes").delete().eq("id", id).execute()
     return {"status": "ok"}
 
+
+@app.put("/vault/notes/{id}")
+async def update_note(id: str, n: NoteUpdateReq):
+    existing = supabase.table("sticky_notes").select("id").eq("id", id).eq("user_id", n.user_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    supabase.table("sticky_notes").update({
+        "note_content": _encrypt_text(n.content),
+    }).eq("id", id).eq("user_id", n.user_id).execute()
+    return {"status": "ok"}
+
 @app.post("/vault/passwords")
 async def add_pass(p: PassReq):
     supabase.table("saved_passwords").insert({
@@ -486,6 +595,238 @@ async def auth_qr(id: str, user_id: str):
         "qr_code_url": qr_code_url,
     }
 
+
+@app.get("/vault/authenticator/codes")
+async def auth_codes(user_id: str):
+    res = supabase.table("authenticator_seeds").select("id, issuer, account_name, secret_key").eq("user_id", user_id).execute()
+
+    items = []
+    for entry in (res.data or []):
+        issuer = _decrypt_text(entry.get("issuer")) or "Unknown"
+        account_name = _decrypt_text(entry.get("account_name")) or ""
+        secret_key = _decrypt_text(entry.get("secret_key"))
+        if not _is_valid_totp_secret(secret_key):
+            continue
+
+        try:
+            totp_payload = _build_totp_payload(secret_key)
+        except Exception:
+            continue
+
+        items.append({
+            "id": entry.get("id"),
+            "issuer": issuer,
+            "account_name": account_name,
+            **totp_payload,
+        })
+
+    return {"items": items}
+
+
+@app.post("/chat/rooms")
+async def create_chat_room(req: ChatCreateReq):
+    room_id = uuid.uuid4().hex[:10]
+    session_id = uuid.uuid4().hex
+    display_name = _random_display_name()
+    now_iso = _now_iso()
+
+    # Save to database
+    try:
+        supabase.table("chat_rooms").insert({
+            "id": room_id,
+            "creator_user_id": req.user_id,
+            "created_at": now_iso,
+        }).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create chat room: {str(e)}")
+
+    # Save creator as participant
+    try:
+        supabase.table("chat_participants").insert({
+            "room_id": room_id,
+            "user_id": req.user_id,
+            "session_id": session_id,
+            "display_name": display_name,
+            "joined_at": now_iso,
+        }).execute()
+    except Exception:
+        pass
+
+    # Also keep in-memory for real-time features
+    now_ts = time.time()
+    CHAT_ROOMS[room_id] = {
+        "id": room_id,
+        "created_at": now_iso,
+        "creator_session_id": session_id,
+        "creator_user_id": req.user_id,
+        "participants": {
+            session_id: {
+                "display_name": display_name,
+                "joined_at": now_iso,
+                "last_seen": now_iso,
+                "last_seen_ts": now_ts,
+            }
+        },
+        "messages": [],
+    }
+
+    return {
+        "room_id": room_id,
+        "session_id": session_id,
+        "display_name": display_name,
+        "is_creator": True,
+        "joined_at": now_iso,
+    }
+
+
+@app.post("/chat/rooms/{room_id}/join")
+async def join_chat_room(room_id: str, req: ChatJoinReq):
+    room = _get_room_or_404(room_id)
+    _prune_stale_participants(room)
+
+    session_id = uuid.uuid4().hex
+    display_name = _random_display_name()
+    now_ts = time.time()
+    now_iso = _now_iso()
+
+    # Save participant to database
+    try:
+        supabase.table("chat_participants").insert({
+            "room_id": room_id,
+            "user_id": req.user_id if req.user_id else None,
+            "session_id": session_id,
+            "display_name": display_name,
+            "joined_at": now_iso,
+        }).execute()
+    except Exception:
+        pass
+
+    room["participants"][session_id] = {
+        "display_name": display_name,
+        "joined_at": now_iso,
+        "last_seen": now_iso,
+        "last_seen_ts": now_ts,
+    }
+
+    is_creator = room.get("creator_user_id") and room.get("creator_user_id") == req.user_id
+
+    return {
+        "room_id": room_id,
+        "session_id": session_id,
+        "display_name": display_name,
+        "is_creator": is_creator,
+        "joined_at": now_iso,
+    }
+
+
+@app.get("/chat/rooms/{room_id}/state")
+async def chat_room_state(room_id: str, session_id: str):
+    room = _get_room_or_404(room_id)
+    if session_id not in room["participants"]:
+        raise HTTPException(status_code=403, detail="Not a room participant")
+
+    now_ts = time.time()
+    now_iso = _now_iso()
+    room["participants"][session_id]["last_seen"] = now_iso
+    room["participants"][session_id]["last_seen_ts"] = now_ts
+
+    participants = [
+        {
+            "session_id": sid,
+            "display_name": member.get("display_name", "Anonymous"),
+            "joined_at": member.get("joined_at"),
+        }
+        for sid, member in room["participants"].items()
+        if now_ts - float(member.get("last_seen_ts", 0)) <= CHAT_STALE_SECONDS
+    ]
+
+    return {
+        "room_id": room_id,
+        "is_creator": session_id == room["creator_session_id"],
+        "participants_count": _active_count(room),
+        "participants": participants,
+    }
+
+
+@app.get("/chat/rooms/{room_id}/messages")
+async def chat_room_messages(room_id: str, session_id: str):
+    room = _get_room_or_404(room_id)
+    if session_id not in room["participants"]:
+        raise HTTPException(status_code=403, detail="Not a room participant")
+
+    return {"messages": room["messages"]}
+
+
+@app.post("/chat/rooms/{room_id}/messages")
+async def chat_send_message(room_id: str, req: ChatSendReq):
+    room = _get_room_or_404(room_id)
+    member = room["participants"].get(req.session_id)
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a room participant")
+
+    content = (req.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message content is required")
+
+    now_ts = time.time()
+    now_iso = _now_iso()
+    member["last_seen"] = now_iso
+    member["last_seen_ts"] = now_ts
+
+    message_id = uuid.uuid4().hex
+    author = member.get("display_name", "Anonymous")
+
+    # Save message to database
+    try:
+        supabase.table("chat_messages").insert({
+            "id": message_id,
+            "room_id": room_id,
+            "session_id": req.session_id,
+            "author": author,
+            "content": content,
+            "created_at": now_iso,
+        }).execute()
+    except Exception:
+        pass
+
+    message = {
+        "id": message_id,
+        "session_id": req.session_id,
+        "author": author,
+        "content": content,
+        "created_at": now_iso,
+    }
+    room["messages"].append(message)
+
+    return {"status": "ok", "message": message}
+
+
+@app.post("/chat/rooms/{room_id}/leave")
+async def chat_leave_room(room_id: str, req: ChatLeaveReq):
+    room = _get_room_or_404(room_id)
+    room["participants"].pop(req.session_id, None)
+    # Note: We keep the participant record in the database for history
+    return {"status": "ok"}
+
+
+@app.delete("/chat/rooms/{room_id}")
+async def delete_chat_room(room_id: str, req: ChatDeleteReq):
+    room = _get_room_or_404(room_id)
+    if room.get("creator_user_id") != req.user_id:
+        raise HTTPException(status_code=403, detail="Only the room creator can delete this room")
+    
+    # Delete from database
+    try:
+        supabase.table("chat_messages").delete().eq("room_id", room_id).execute()
+        supabase.table("chat_participants").delete().eq("room_id", room_id).execute()
+        supabase.table("chat_rooms").delete().eq("id", room_id).execute()
+    except Exception:
+        pass
+    
+    # Delete from memory
+    CHAT_ROOMS.pop(room_id, None)
+    return {"status": "deleted"}
+
 @app.delete("/vault/authenticator/{id}")
 async def del_auth(id: str):
     supabase.table("authenticator_seeds").delete().eq("id", id).execute()
@@ -509,6 +850,40 @@ async def get_recovery_kit(user_id: str):
     }
 
 # --- MISC ---
+@app.get("/chat/rooms/user/{user_id}")
+async def get_user_chat_rooms(user_id: str):
+    """Get all chat rooms created by or joined by this user"""
+    try:
+        # Get rooms created by user
+        created = supabase.table("chat_rooms").select("id, created_at, creator_user_id").eq("creator_user_id", user_id).execute().data or []
+        
+        # Get rooms user has participated in
+        participated_data = supabase.table("chat_participants").select("room_id").eq("user_id", user_id).execute().data or []
+        participated_room_ids = [p["room_id"] for p in participated_data]
+        
+        # Get full room data for participated rooms
+        participated = []
+        if participated_room_ids:
+            participated = supabase.table("chat_rooms").select("id, created_at, creator_user_id").in_("id", participated_room_ids).execute().data or []
+        
+        # Get message counts and latest message
+        all_rooms = {r["id"]: {**r, "message_count": 0, "latest_message_at": None} for r in created + participated}
+        
+        for room_id in all_rooms.keys():
+            msg_count = supabase.table("chat_messages").select("id").eq("room_id", room_id).execute()
+            all_rooms[room_id]["message_count"] = len(msg_count.data or [])
+            
+            latest = supabase.table("chat_messages").select("created_at").eq("room_id", room_id).order("created_at", desc=True).limit(1).execute()
+            if latest.data:
+                all_rooms[room_id]["latest_message_at"] = latest.data[0]["created_at"]
+        
+        return {
+            "rooms": list(all_rooms.values()),
+            "count": len(all_rooms)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch chat rooms: {str(e)}")
+
 @app.get("/misc/security-quotes")
 async def security_quotes():
     quotes = [
@@ -535,6 +910,57 @@ async def generate_passwords(req: PasswordGeneratorReq):
         count=req.count,
     )
     return {"variants": variants}
+
+@app.post("/tools/ai-crack-estimate")
+async def ai_crack_estimate(req: AICrackEstimateReq):
+    # Prepare the prompt with the dynamic data
+    prompt = f"""
+    Analyze the following password metrics:
+    Theoretical Entropy: {req.entropyBits} bits
+    Expected Guesses to Crack (Zxcvbn heuristic): {req.expectedGuesses}
+
+    Calculate and format the estimated crack times for:
+    1. Online attack (rate limited to 100 guesses/sec)
+    2. Offline PC (100 Million guesses/sec)
+    3. High-end GPU Array (100 Billion guesses/sec)
+
+    Also provide a brief 1-2 sentence 'aiNote' explaining the vulnerability or strength of these metrics in the real world.
+
+    Return the results as a strict JSON object with the following keys: "online", "offline", "gpu", and "aiNote". The time estimates should be human-readable strings (e.g., "2 years", "3 months", "5000 years").
+
+    IMPORTANT: Return ONLY a raw JSON object. Do not wrap it in markdown blockticks (```json). The keys must be exact.
+    Format:
+    {{
+      "online": "time string",
+      "offline": "time string",
+      "gpu": "time string",
+      "aiNote": "your brief explanation"
+    }}
+    """
+
+    try:
+        # Initialize the model and force it to return strict JSON
+        model = genai.GenerativeModel('gemini-2.5-flash-lite', s)
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                temperature=0.2, 
+                response_mime_type="application/json"
+            )
+        )
+
+        
+        raw_text = response.text
+        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+
+       
+        parsed_data = json.loads(raw_text)
+        return parsed_data
+
+    except Exception as e:
+        print(f"Gemini API Error: {e}")
+        
+        raise HTTPException(status_code=500, detail="Failed to fetch AI estimate")
 
 
 @app.post("/tools/authenticator/scan-qr")
