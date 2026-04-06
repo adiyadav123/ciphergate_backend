@@ -940,7 +940,7 @@ async def ai_crack_estimate(req: AICrackEstimateReq):
 
     try:
         # Initialize the model and force it to return strict JSON
-        model = genai.GenerativeModel('gemini-2.5-flash-lite', s)
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
         response = model.generate_content(
             prompt,
             generation_config=genai.GenerationConfig(
