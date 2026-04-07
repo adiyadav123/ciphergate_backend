@@ -9,7 +9,7 @@ import binascii
 import time
 import pyotp
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, unquote, urlparse, parse_qs
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,6 +64,7 @@ class MFAChallengeReq(BaseModel):
 class MFAVerifyReq(BaseModel):
     user_id: str
     code: str
+    is_reauth: bool = False
 
 
 class RecoveryVerifyReq(BaseModel):
@@ -107,12 +108,22 @@ class UserScopeReq(BaseModel):
     user_id: str
 
 
+class OneTimeSecretCreateReq(BaseModel):
+    user_id: str
+    content: str
+    expires_in_minutes: int = 30
+
+
 class ChatCreateReq(BaseModel):
     user_id: str
+    invite_policy: str = "link"
+    passcode: str | None = None
+    approved_user_ids: list[str] | None = None
 
 
 class ChatJoinReq(BaseModel):
     user_id: str | None = None
+    passcode: str | None = None
 
 
 class PasswordGeneratorReq(BaseModel):
@@ -138,11 +149,34 @@ class ChatSendReq(BaseModel):
 class ChatDeleteReq(BaseModel):
     user_id: str
     session_id: str
+    deletion_reason: str | None = None
 
 
 class ChatLeaveReq(BaseModel):
+    user_id: str | None = None
+    session_id: str
+
+
+class ChatUpdateSettingsReq(BaseModel):
     user_id: str
     session_id: str
+    invite_policy: str | None = None
+    passcode: str | None = None
+    clear_passcode: bool = False
+    approved_user_ids: list[str] | None = None
+
+
+class ChatApprovalReq(BaseModel):
+    user_id: str
+    session_id: str
+    target_user_id: str
+    action: str = "add"
+
+
+class ChatTypingReq(BaseModel):
+    user_id: str
+    session_id: str
+    is_typing: bool = True
 
 
 def _is_valid_totp_secret(secret: str | None) -> bool:
@@ -264,10 +298,32 @@ def _build_totp_payload(secret_key: str):
 
 CHAT_ROOMS: dict[str, dict] = {}
 CHAT_STALE_SECONDS = 45
+CHAT_SYSTEM_AUTHOR = "__system__"
+SYSTEM_EVENT_PREFIX = "SYS_EVENT::"
+CHAT_DEFAULT_INVITE_POLICY = "link"
+CHAT_ROOM_SETTINGS: dict[str, dict] = {}
+CHAT_DELETED_ROOMS: dict[str, dict] = {}
+CHAT_AUDIT_LOGS: list[dict] = []
+CHAT_ROOM_APPROVAL_REQUESTS: dict[str, list[dict]] = {}
+CHAT_ROOM_TYPING: dict[str, dict[str, dict]] = {}
+ONE_TIME_SECRETS: dict[str, dict] = {}
+ONE_TIME_SECRET_MIN_MINUTES = 1
+ONE_TIME_SECRET_MAX_MINUTES = 10080
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _cleanup_one_time_secrets() -> None:
+    now_ts = time.time()
+    expired_tokens = [
+        token
+        for token, payload in ONE_TIME_SECRETS.items()
+        if float(payload.get("expires_ts", 0)) <= now_ts or bool(payload.get("consumed"))
+    ]
+    for token in expired_tokens:
+        ONE_TIME_SECRETS.pop(token, None)
 
 
 def _random_display_name() -> str:
@@ -280,11 +336,341 @@ def _random_display_name() -> str:
     return f"{secrets.choice(adjectives)}{secrets.choice(nouns)}{secrets.randbelow(90) + 10}"
 
 
+def _hash_passcode(passcode: str) -> str:
+    normalized = str(passcode or "").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _verify_passcode(passcode_hash: str | None, provided: str | None) -> bool:
+    if not passcode_hash:
+        return True
+    if not provided:
+        return False
+    return _hash_passcode(provided) == passcode_hash
+
+
+def _normalize_invite_policy(policy: str | None) -> str:
+    normalized = (policy or CHAT_DEFAULT_INVITE_POLICY).strip().lower()
+    if normalized not in {"link", "approval"}:
+        return CHAT_DEFAULT_INVITE_POLICY
+    return normalized
+
+
+def _default_room_settings() -> dict:
+    return {
+        "invite_policy": CHAT_DEFAULT_INVITE_POLICY,
+        "passcode_hash": None,
+        "approved_user_ids": [],
+    }
+
+
+def _make_system_event(kind: str, payload: dict) -> str:
+    return f"{SYSTEM_EVENT_PREFIX}{json.dumps({'kind': kind, 'payload': payload}, separators=(',', ':'))}"
+
+
+def _parse_system_event(content: str | None) -> dict | None:
+    text = str(content or "")
+    if not text.startswith(SYSTEM_EVENT_PREFIX):
+        return None
+    raw = text[len(SYSTEM_EVENT_PREFIX):]
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _sanitize_room_settings(raw: dict | None) -> dict:
+    base = _default_room_settings()
+    if not isinstance(raw, dict):
+        return base
+    base["invite_policy"] = _normalize_invite_policy(raw.get("invite_policy"))
+    passcode_hash = raw.get("passcode_hash")
+    base["passcode_hash"] = passcode_hash if isinstance(passcode_hash, str) and passcode_hash else None
+    approved = raw.get("approved_user_ids") or []
+    if isinstance(approved, list):
+        base["approved_user_ids"] = [str(x).strip() for x in approved if str(x).strip()]
+    return base
+
+
+def _sanitize_approval_requests(raw: list | None) -> list[dict]:
+    if not isinstance(raw, list):
+        return []
+    clean = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        user_id = str(item.get("user_id") or "").strip()
+        email = str(item.get("email") or "").strip()
+        requested_at = str(item.get("requested_at") or "").strip() or _now_iso()
+        if not user_id and not email:
+            continue
+        clean.append({
+            "user_id": user_id or None,
+            "email": email or None,
+            "requested_at": requested_at,
+        })
+    return clean
+
+
+def _lookup_user_email(user_id: str | None) -> str | None:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return None
+    try:
+        res = supabase.table("users").select("email").eq("id", uid).limit(1).execute().data or []
+        if res:
+            email = str(res[0].get("email") or "").strip()
+            return email or None
+    except Exception:
+        pass
+    return None
+
+
+def _register_approval_request(room_id: str, user_id: str | None) -> list[dict]:
+    current = _sanitize_approval_requests(CHAT_ROOM_APPROVAL_REQUESTS.get(room_id) or [])
+    uid = str(user_id or "").strip() or None
+    email = _lookup_user_email(uid)
+
+    exists = False
+    for req in current:
+        if uid and req.get("user_id") == uid:
+            exists = True
+            break
+        if email and req.get("email") == email:
+            exists = True
+            break
+
+    if not exists:
+        entry = {
+            "user_id": uid,
+            "email": email,
+            "requested_at": _now_iso(),
+        }
+        current.append(entry)
+        _persist_system_event(room_id, "approval_request", entry)
+
+    CHAT_ROOM_APPROVAL_REQUESTS[room_id] = current
+    return current
+
+
+def _resolve_approval_request(room_id: str, target_user_id: str | None):
+    uid = str(target_user_id or "").strip() or None
+    if not uid:
+        return
+    current = _sanitize_approval_requests(CHAT_ROOM_APPROVAL_REQUESTS.get(room_id) or [])
+    next_requests = [req for req in current if req.get("user_id") != uid]
+    CHAT_ROOM_APPROVAL_REQUESTS[room_id] = next_requests
+    _persist_system_event(room_id, "approval_request_resolved", {"user_id": uid, "resolved_at": _now_iso()})
+
+
+def _persist_system_event(room_id: str, kind: str, payload: dict):
+    try:
+        supabase.table("chat_messages").insert({
+            "id": uuid.uuid4().hex,
+            "room_id": room_id,
+            "session_id": "system",
+            "author": CHAT_SYSTEM_AUTHOR,
+            "content": _make_system_event(kind, payload),
+            "created_at": _now_iso(),
+        }).execute()
+    except Exception:
+        pass
+
+
+def _audit_event(event_type: str, user_id: str | None = None, room_id: str | None = None, status: str = "success", meta: dict | None = None):
+    entry = {
+        "id": uuid.uuid4().hex,
+        "event_type": event_type,
+        "user_id": user_id,
+        "room_id": room_id,
+        "status": status,
+        "meta": meta or {},
+        "created_at": _now_iso(),
+    }
+    CHAT_AUDIT_LOGS.append(entry)
+    if len(CHAT_AUDIT_LOGS) > 2000:
+        del CHAT_AUDIT_LOGS[:500]
+
+    # Optional persistence if a compatible table exists in Supabase.
+    try:
+        supabase.table("security_audit_logs").insert({
+            "id": entry["id"],
+            "event_type": entry["event_type"],
+            "user_id": entry["user_id"],
+            "room_id": entry["room_id"],
+            "status": entry["status"],
+            "meta": json.dumps(entry["meta"]),
+            "created_at": entry["created_at"],
+        }).execute()
+    except Exception:
+        pass
+
+
+def _build_tombstone(room_id: str) -> dict | None:
+    if room_id in CHAT_DELETED_ROOMS:
+        return CHAT_DELETED_ROOMS[room_id]
+
+    try:
+        rows = supabase.table("chat_messages").select("content, created_at").eq("room_id", room_id).eq("author", CHAT_SYSTEM_AUTHOR).order("created_at", desc=True).limit(25).execute().data or []
+    except Exception:
+        rows = []
+
+    for row in rows:
+        evt = _parse_system_event(row.get("content"))
+        if evt and evt.get("kind") == "room_deleted":
+            payload = evt.get("payload") or {}
+            tombstone = {
+                "room_id": room_id,
+                "deleted_at": payload.get("deleted_at") or row.get("created_at") or _now_iso(),
+                "deleted_by": payload.get("deleted_by"),
+                "reason": payload.get("reason") or "Deleted by the room owner",
+            }
+            CHAT_DELETED_ROOMS[room_id] = tombstone
+            return tombstone
+    return None
+
+
+def _room_deleted_http(room_id: str) -> HTTPException:
+    tombstone = _build_tombstone(room_id) or {
+        "room_id": room_id,
+        "deleted_at": _now_iso(),
+        "deleted_by": None,
+        "reason": "Deleted by the room owner",
+    }
+    return HTTPException(
+        status_code=410,
+        detail={
+            "code": "ROOM_DELETED",
+            "message": "This room has been deleted",
+            **tombstone,
+        },
+    )
+
+
+def _parse_room_stream(messages_data: list[dict]) -> tuple[dict, dict | None, list[dict], list[dict]]:
+    settings = _default_room_settings()
+    tombstone = None
+    visible_messages = []
+    approval_requests: list[dict] = []
+
+    for m in messages_data:
+        if m.get("author") == CHAT_SYSTEM_AUTHOR:
+            evt = _parse_system_event(m.get("content"))
+            if not evt:
+                continue
+            kind = evt.get("kind")
+            payload = evt.get("payload") or {}
+            if kind == "room_settings":
+                settings = _sanitize_room_settings(payload)
+            elif kind == "room_deleted":
+                tombstone = {
+                    "room_id": payload.get("room_id") or m.get("room_id"),
+                    "deleted_at": payload.get("deleted_at") or m.get("created_at") or _now_iso(),
+                    "deleted_by": payload.get("deleted_by"),
+                    "reason": payload.get("reason") or "Deleted by the room owner",
+                }
+            elif kind == "approval_request":
+                req = {
+                    "user_id": payload.get("user_id"),
+                    "email": payload.get("email"),
+                    "requested_at": payload.get("requested_at") or m.get("created_at") or _now_iso(),
+                }
+                normalized = _sanitize_approval_requests([req])
+                if normalized:
+                    candidate = normalized[0]
+                    if not any((candidate.get("user_id") and x.get("user_id") == candidate.get("user_id")) or (candidate.get("email") and x.get("email") == candidate.get("email")) for x in approval_requests):
+                        approval_requests.append(candidate)
+            elif kind == "approval_request_resolved":
+                uid = str(payload.get("user_id") or "").strip()
+                if uid:
+                    approval_requests = [x for x in approval_requests if x.get("user_id") != uid]
+            continue
+
+        visible_messages.append({
+            "id": m.get("id"),
+            "session_id": m.get("session_id"),
+            "author": m.get("author", "Anonymous"),
+            "content": m.get("content"),
+            "created_at": m.get("created_at"),
+        })
+
+    return settings, tombstone, visible_messages, approval_requests
+
+
 def _get_room_or_404(room_id: str) -> dict:
-    room = CHAT_ROOMS.get(room_id)
-    if not room:
+    if _build_tombstone(room_id):
+        raise _room_deleted_http(room_id)
+
+    # Check in-memory cache first
+    if room_id in CHAT_ROOMS:
+        if room_id in CHAT_DELETED_ROOMS:
+            raise _room_deleted_http(room_id)
+        return CHAT_ROOMS[room_id]
+    
+    # Try to load from database if not in memory
+    try:
+        db_room = supabase.table("chat_rooms").select("*").eq("id", room_id).execute().data
+        if not db_room:
+            raise HTTPException(status_code=404, detail="Chat room not found")
+        
+        room_data = db_room[0]
+        
+        # Load participants from database
+        participants_data = supabase.table("chat_participants").select("*").eq("room_id", room_id).execute().data or []
+        
+        # Load only system events first (settings/tombstone/approvals). User messages are lazy-loaded.
+        system_messages = (
+            supabase
+            .table("chat_messages")
+            .select("id, room_id, session_id, author, content, created_at")
+            .eq("room_id", room_id)
+            .eq("author", CHAT_SYSTEM_AUTHOR)
+            .order("created_at", desc=False)
+            .execute()
+            .data
+            or []
+        )
+
+        settings, tombstone, _, approval_requests = _parse_room_stream(system_messages)
+        if tombstone:
+            CHAT_DELETED_ROOMS[room_id] = tombstone
+            raise _room_deleted_http(room_id)
+        
+        # Initialize room in memory with data from database
+        now_ts = time.time()
+        participants = {}
+        for p in participants_data:
+            participants[p["session_id"]] = {
+                "user_id": p.get("user_id"),
+                "display_name": p.get("display_name", "Anonymous"),
+                "joined_at": p.get("joined_at"),
+                "last_seen": p.get("joined_at"),  # Default to joined_at for old sessions
+                "last_seen_ts": now_ts,  # Treat as recently active since we're loading it
+            }
+        
+        CHAT_ROOM_SETTINGS[room_id] = settings
+        CHAT_ROOM_APPROVAL_REQUESTS[room_id] = approval_requests
+        
+        CHAT_ROOMS[room_id] = {
+            "id": room_data.get("id"),
+            "created_at": room_data.get("created_at"),
+            "creator_session_id": None,  # Can't determine from DB, will be set on join
+            "creator_user_id": room_data.get("creator_user_id"),
+            "participants": participants,
+            "messages": [],
+            "messages_loaded": False,
+            "settings": settings,
+            "approval_requests": approval_requests,
+        }
+        
+        return CHAT_ROOMS[room_id]
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=404, detail="Chat room not found")
-    return room
 
 
 def _prune_stale_participants(room: dict):
@@ -300,6 +686,34 @@ def _prune_stale_participants(room: dict):
 def _active_count(room: dict) -> int:
     _prune_stale_participants(room)
     return len(room["participants"])
+
+
+def _active_typing_users(room_id: str, exclude_session_id: str | None = None) -> list[dict]:
+    now_ts = time.time()
+    room_typing = CHAT_ROOM_TYPING.get(room_id) or {}
+    active = []
+    stale_sessions = []
+
+    for session_id, entry in room_typing.items():
+        if exclude_session_id and session_id == exclude_session_id:
+            continue
+        if now_ts - float(entry.get("last_seen_ts", 0)) > 5:
+            stale_sessions.append(session_id)
+            continue
+        active.append({
+            "session_id": session_id,
+            "user_id": entry.get("user_id"),
+            "display_name": entry.get("display_name", "Anonymous"),
+        })
+
+    for session_id in stale_sessions:
+        room_typing.pop(session_id, None)
+    if room_typing:
+        CHAT_ROOM_TYPING[room_id] = room_typing
+    elif room_id in CHAT_ROOM_TYPING:
+        CHAT_ROOM_TYPING.pop(room_id, None)
+
+    return active
 
 # --- AUTH ROUTES ---
 @app.post("/auth/register")
@@ -367,16 +781,20 @@ async def mfa_challenge(req: MFAChallengeReq):
 async def mfa_verify(req: MFAVerifyReq):
     res = supabase.table("users").select("id, otp_secret").eq("id", req.user_id).execute()
     if not res.data:
+        _audit_event("mfa_verify", user_id=req.user_id, status="failed", meta={"reason": "user_not_found", "reauth": bool(req.is_reauth)})
         raise HTTPException(status_code=404, detail="User not found")
 
     secret = res.data[0].get("otp_secret")
     if not _is_valid_totp_secret(secret):
+        _audit_event("mfa_verify", user_id=req.user_id, status="failed", meta={"reason": "mfa_not_initialized", "reauth": bool(req.is_reauth)})
         raise HTTPException(status_code=400, detail="MFA is not initialized for this account")
 
     if not auth_logic.verify_totp_code(secret, req.code):
+        _audit_event("mfa_verify", user_id=req.user_id, status="failed", meta={"reason": "invalid_code", "reauth": bool(req.is_reauth)})
         raise HTTPException(status_code=401, detail="Invalid authenticator code")
 
     supabase.table("users").update({"is_mfa_enabled": True}).eq("id", req.user_id).execute()
+    _audit_event("mfa_reauth" if req.is_reauth else "mfa_verify", user_id=req.user_id, status="success", meta={"reauth": bool(req.is_reauth)})
     return {"status": "verified"}
 
 
@@ -629,6 +1047,15 @@ async def create_chat_room(req: ChatCreateReq):
     session_id = uuid.uuid4().hex
     display_name = _random_display_name()
     now_iso = _now_iso()
+    invite_policy = _normalize_invite_policy(req.invite_policy)
+    approved = [str(x).strip() for x in (req.approved_user_ids or []) if str(x).strip()]
+    if req.user_id and req.user_id not in approved:
+        approved.append(req.user_id)
+    settings = {
+        "invite_policy": invite_policy,
+        "passcode_hash": _hash_passcode(req.passcode) if (req.passcode or "").strip() else None,
+        "approved_user_ids": approved,
+    }
 
     # Save to database
     try:
@@ -661,6 +1088,7 @@ async def create_chat_room(req: ChatCreateReq):
         "creator_user_id": req.user_id,
         "participants": {
             session_id: {
+                "user_id": req.user_id,
                 "display_name": display_name,
                 "joined_at": now_iso,
                 "last_seen": now_iso,
@@ -668,7 +1096,11 @@ async def create_chat_room(req: ChatCreateReq):
             }
         },
         "messages": [],
+        "settings": settings,
     }
+    CHAT_ROOM_SETTINGS[room_id] = settings
+    _persist_system_event(room_id, "room_settings", settings)
+    _audit_event("chat_room_create", user_id=req.user_id, room_id=room_id, status="success", meta={"invite_policy": invite_policy, "has_passcode": bool(settings["passcode_hash"])})
 
     return {
         "room_id": room_id,
@@ -676,6 +1108,11 @@ async def create_chat_room(req: ChatCreateReq):
         "display_name": display_name,
         "is_creator": True,
         "joined_at": now_iso,
+        "room_settings": {
+            "invite_policy": settings["invite_policy"],
+            "has_passcode": bool(settings.get("passcode_hash")),
+            "approved_count": len(settings.get("approved_user_ids") or []),
+        },
     }
 
 
@@ -688,12 +1125,36 @@ async def join_chat_room(room_id: str, req: ChatJoinReq):
     display_name = _random_display_name()
     now_ts = time.time()
     now_iso = _now_iso()
+    settings = _sanitize_room_settings(room.get("settings") or CHAT_ROOM_SETTINGS.get(room_id) or _default_room_settings())
+    room["settings"] = settings
+    CHAT_ROOM_SETTINGS[room_id] = settings
+
+    requester_id = (req.user_id or "").strip() or None
+    creator_id = room.get("creator_user_id")
+    approved_ids = set(settings.get("approved_user_ids") or [])
+
+    if settings.get("invite_policy") == "approval":
+        is_allowed = bool(requester_id and (requester_id == creator_id or requester_id in approved_ids))
+        if not is_allowed:
+            pending = _register_approval_request(room_id, requester_id)
+            if room_id in CHAT_ROOMS:
+                CHAT_ROOMS[room_id]["approval_requests"] = pending
+            _audit_event("chat_room_join", user_id=requester_id, room_id=room_id, status="failed", meta={"reason": "approval_required"})
+            raise HTTPException(status_code=403, detail={"code": "ROOM_APPROVAL_REQUIRED", "message": "This room requires owner approval"})
+
+    if settings.get("passcode_hash") and requester_id != creator_id:
+        if not (req.passcode or "").strip():
+            _audit_event("chat_room_join", user_id=requester_id, room_id=room_id, status="failed", meta={"reason": "passcode_required"})
+            raise HTTPException(status_code=403, detail={"code": "ROOM_PASSCODE_REQUIRED", "message": "Room passcode is required"})
+        if not _verify_passcode(settings.get("passcode_hash"), req.passcode):
+            _audit_event("chat_room_join", user_id=requester_id, room_id=room_id, status="failed", meta={"reason": "passcode_invalid"})
+            raise HTTPException(status_code=403, detail={"code": "ROOM_PASSCODE_INVALID", "message": "Invalid room passcode"})
 
     # Save participant to database
     try:
         supabase.table("chat_participants").insert({
             "room_id": room_id,
-            "user_id": req.user_id if req.user_id else None,
+            "user_id": requester_id,
             "session_id": session_id,
             "display_name": display_name,
             "joined_at": now_iso,
@@ -702,20 +1163,29 @@ async def join_chat_room(room_id: str, req: ChatJoinReq):
         pass
 
     room["participants"][session_id] = {
+        "user_id": requester_id,
         "display_name": display_name,
         "joined_at": now_iso,
         "last_seen": now_iso,
         "last_seen_ts": now_ts,
     }
+    room.setdefault("approval_requests", CHAT_ROOM_APPROVAL_REQUESTS.get(room_id) or [])
 
-    is_creator = room.get("creator_user_id") and room.get("creator_user_id") == req.user_id
+    is_creator = bool(room.get("creator_user_id") and room.get("creator_user_id") == requester_id)
+    _audit_event("chat_room_join", user_id=requester_id, room_id=room_id, status="success", meta={"invite_policy": settings.get("invite_policy")})
 
     return {
         "room_id": room_id,
         "session_id": session_id,
         "display_name": display_name,
         "is_creator": is_creator,
+        "creator_user_id": creator_id,
         "joined_at": now_iso,
+        "room_settings": {
+            "invite_policy": settings["invite_policy"],
+            "has_passcode": bool(settings.get("passcode_hash")),
+            "approved_count": len(settings.get("approved_user_ids") or []),
+        },
     }
 
 
@@ -723,7 +1193,7 @@ async def join_chat_room(room_id: str, req: ChatJoinReq):
 async def chat_room_state(room_id: str, session_id: str):
     room = _get_room_or_404(room_id)
     if session_id not in room["participants"]:
-        raise HTTPException(status_code=403, detail="Not a room participant")
+        raise HTTPException(status_code=403, detail={"code": "NOT_ROOM_PARTICIPANT", "message": "Not a room participant"})
 
     now_ts = time.time()
     now_iso = _now_iso()
@@ -740,11 +1210,29 @@ async def chat_room_state(room_id: str, session_id: str):
         if now_ts - float(member.get("last_seen_ts", 0)) <= CHAT_STALE_SECONDS
     ]
 
+    participant_user_id = room["participants"][session_id].get("user_id")
+    is_creator = bool(room.get("creator_user_id") and participant_user_id and room.get("creator_user_id") == participant_user_id)
+    settings = _sanitize_room_settings(room.get("settings") or CHAT_ROOM_SETTINGS.get(room_id) or _default_room_settings())
+    room["settings"] = settings
+    pending_requests = _sanitize_approval_requests(room.get("approval_requests") or CHAT_ROOM_APPROVAL_REQUESTS.get(room_id) or [])
+    CHAT_ROOM_APPROVAL_REQUESTS[room_id] = pending_requests
+    room["approval_requests"] = pending_requests
+    typing_users = _active_typing_users(room_id, exclude_session_id=session_id)
+
     return {
         "room_id": room_id,
-        "is_creator": session_id == room["creator_session_id"],
+        "is_creator": is_creator,
+        "creator_user_id": room.get("creator_user_id"),
         "participants_count": _active_count(room),
         "participants": participants,
+        "room_settings": {
+            "invite_policy": settings["invite_policy"],
+            "has_passcode": bool(settings.get("passcode_hash")),
+            "approved_count": len(settings.get("approved_user_ids") or []),
+            "viewer_is_approved": bool(participant_user_id and (participant_user_id in (settings.get("approved_user_ids") or []) or participant_user_id == room.get("creator_user_id"))),
+        },
+        "pending_approval_requests": pending_requests if is_creator else [],
+        "typing_users": typing_users,
     }
 
 
@@ -752,7 +1240,32 @@ async def chat_room_state(room_id: str, session_id: str):
 async def chat_room_messages(room_id: str, session_id: str):
     room = _get_room_or_404(room_id)
     if session_id not in room["participants"]:
-        raise HTTPException(status_code=403, detail="Not a room participant")
+        raise HTTPException(status_code=403, detail={"code": "NOT_ROOM_PARTICIPANT", "message": "Not a room participant"})
+
+    # Lazy-load user messages for rooms reconstructed from DB to make join/state fast.
+    if not room.get("messages_loaded", True):
+        db_messages = (
+            supabase
+            .table("chat_messages")
+            .select("id, session_id, author, content, created_at")
+            .eq("room_id", room_id)
+            .neq("author", CHAT_SYSTEM_AUTHOR)
+            .order("created_at", desc=False)
+            .execute()
+            .data
+            or []
+        )
+        room["messages"] = [
+            {
+                "id": m.get("id"),
+                "session_id": m.get("session_id"),
+                "author": m.get("author", "Anonymous"),
+                "content": m.get("content"),
+                "created_at": m.get("created_at"),
+            }
+            for m in db_messages
+        ]
+        room["messages_loaded"] = True
 
     return {"messages": room["messages"]}
 
@@ -762,7 +1275,7 @@ async def chat_send_message(room_id: str, req: ChatSendReq):
     room = _get_room_or_404(room_id)
     member = room["participants"].get(req.session_id)
     if not member:
-        raise HTTPException(status_code=403, detail="Not a room participant")
+        raise HTTPException(status_code=403, detail={"code": "NOT_ROOM_PARTICIPANT", "message": "Not a room participant"})
 
     content = (req.content or "").strip()
     if not content:
@@ -797,6 +1310,12 @@ async def chat_send_message(room_id: str, req: ChatSendReq):
         "created_at": now_iso,
     }
     room["messages"].append(message)
+    room_typing = CHAT_ROOM_TYPING.get(room_id) or {}
+    room_typing.pop(req.session_id, None)
+    if room_typing:
+        CHAT_ROOM_TYPING[room_id] = room_typing
+    elif room_id in CHAT_ROOM_TYPING:
+        CHAT_ROOM_TYPING.pop(room_id, None)
 
     return {"status": "ok", "message": message}
 
@@ -805,27 +1324,186 @@ async def chat_send_message(room_id: str, req: ChatSendReq):
 async def chat_leave_room(room_id: str, req: ChatLeaveReq):
     room = _get_room_or_404(room_id)
     room["participants"].pop(req.session_id, None)
+    room_typing = CHAT_ROOM_TYPING.get(room_id) or {}
+    room_typing.pop(req.session_id, None)
+    if room_typing:
+        CHAT_ROOM_TYPING[room_id] = room_typing
+    elif room_id in CHAT_ROOM_TYPING:
+        CHAT_ROOM_TYPING.pop(room_id, None)
+    _audit_event("chat_room_leave", user_id=req.user_id, room_id=room_id, status="success")
     # Note: We keep the participant record in the database for history
     return {"status": "ok"}
+
+
+@app.post("/chat/rooms/{room_id}/typing")
+async def chat_room_typing(room_id: str, req: ChatTypingReq):
+    room = _get_room_or_404(room_id)
+    member = room["participants"].get(req.session_id)
+    if not member:
+        raise HTTPException(status_code=403, detail={"code": "NOT_ROOM_PARTICIPANT", "message": "Not a room participant"})
+
+    room_typing = CHAT_ROOM_TYPING.get(room_id) or {}
+    if req.is_typing:
+        room_typing[req.session_id] = {
+            "user_id": req.user_id,
+            "display_name": member.get("display_name", "Anonymous"),
+            "last_seen_ts": time.time(),
+        }
+    else:
+        room_typing.pop(req.session_id, None)
+
+    if room_typing:
+        CHAT_ROOM_TYPING[room_id] = room_typing
+    elif room_id in CHAT_ROOM_TYPING:
+        CHAT_ROOM_TYPING.pop(room_id, None)
+
+    return {"status": "ok", "typing_users": _active_typing_users(room_id, exclude_session_id=req.session_id)}
+
+
+@app.delete("/chat/rooms/{room_id}/messages/{message_id}")
+async def chat_delete_message(room_id: str, message_id: str, user_id: str, session_id: str):
+    room = _get_room_or_404(room_id)
+    member = room["participants"].get(session_id)
+    if not member:
+        raise HTTPException(status_code=403, detail={"code": "NOT_ROOM_PARTICIPANT", "message": "Not a room participant"})
+
+    msg_idx = next((i for i, m in enumerate(room["messages"]) if m.get("id") == message_id), -1)
+    if msg_idx == -1:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    msg = room["messages"][msg_idx]
+    if msg.get("session_id") != session_id and room.get("creator_user_id") != user_id:
+        raise HTTPException(status_code=403, detail={"code": "NOT_MESSAGE_OWNER", "message": "Can only delete your own messages"})
+
+    room["messages"][msg_idx]["content"] = "[message unsent]"
+    try:
+        supabase.table("chat_messages").update({"content": "[message unsent]"}).eq("id", message_id).execute()
+    except Exception:
+        pass
+    _audit_event("chat_message_delete", user_id=user_id, room_id=room_id, message_id=message_id, status="success")
+    return {"status": "ok"}
+
+
+@app.post("/chat/rooms/{room_id}/messages/{message_id}/read")
+async def chat_read_message(room_id: str, message_id: str, user_id: str, session_id: str):
+    room = _get_room_or_404(room_id)
+    member = room["participants"].get(session_id)
+    if not member:
+        raise HTTPException(status_code=403, detail={"code": "NOT_ROOM_PARTICIPANT", "message": "Not a room participant"})
+
+    msg_idx = next((i for i, m in enumerate(room["messages"]) if m.get("id") == message_id), -1)
+    if msg_idx == -1:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    msg = room["messages"][msg_idx]
+    if "read_by" not in msg:
+        msg["read_by"] = []
+    if user_id not in msg["read_by"]:
+        msg["read_by"].append(user_id)
+
+    return {"status": "ok"}
+
+
+@app.patch("/chat/rooms/{room_id}/settings")
+async def update_chat_room_settings(room_id: str, req: ChatUpdateSettingsReq):
+    room = _get_room_or_404(room_id)
+    if room.get("creator_user_id") != req.user_id:
+        raise HTTPException(status_code=403, detail={"code": "ONLY_CREATOR", "message": "Only the room creator can update settings"})
+
+    settings = _sanitize_room_settings(room.get("settings") or CHAT_ROOM_SETTINGS.get(room_id) or _default_room_settings())
+    if req.invite_policy is not None:
+        settings["invite_policy"] = _normalize_invite_policy(req.invite_policy)
+    if req.clear_passcode:
+        settings["passcode_hash"] = None
+    elif (req.passcode or "").strip():
+        settings["passcode_hash"] = _hash_passcode(req.passcode)
+    if req.approved_user_ids is not None:
+        settings["approved_user_ids"] = [str(x).strip() for x in req.approved_user_ids if str(x).strip()]
+        if req.user_id not in settings["approved_user_ids"]:
+            settings["approved_user_ids"].append(req.user_id)
+
+    room["settings"] = settings
+    CHAT_ROOM_SETTINGS[room_id] = settings
+    _persist_system_event(room_id, "room_settings", settings)
+    _audit_event("chat_room_settings_update", user_id=req.user_id, room_id=room_id, status="success", meta={"invite_policy": settings.get("invite_policy"), "has_passcode": bool(settings.get("passcode_hash"))})
+
+    return {
+        "status": "ok",
+        "room_settings": {
+            "invite_policy": settings["invite_policy"],
+            "has_passcode": bool(settings.get("passcode_hash")),
+            "approved_count": len(settings.get("approved_user_ids") or []),
+        },
+    }
+
+
+@app.post("/chat/rooms/{room_id}/approvals")
+async def update_chat_room_approvals(room_id: str, req: ChatApprovalReq):
+    room = _get_room_or_404(room_id)
+    if room.get("creator_user_id") != req.user_id:
+        raise HTTPException(status_code=403, detail={"code": "ONLY_CREATOR", "message": "Only the room creator can update approvals"})
+
+    target_user_id = (req.target_user_id or "").strip()
+    if not target_user_id:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_TARGET", "message": "target_user_id is required"})
+
+    settings = _sanitize_room_settings(room.get("settings") or CHAT_ROOM_SETTINGS.get(room_id) or _default_room_settings())
+    approved = set(settings.get("approved_user_ids") or [])
+    action = (req.action or "add").strip().lower()
+    if action == "remove":
+        approved.discard(target_user_id)
+    else:
+        approved.add(target_user_id)
+    approved.add(req.user_id)
+    settings["approved_user_ids"] = sorted(approved)
+    _resolve_approval_request(room_id, target_user_id)
+
+    room["settings"] = settings
+    CHAT_ROOM_SETTINGS[room_id] = settings
+    room["approval_requests"] = CHAT_ROOM_APPROVAL_REQUESTS.get(room_id) or []
+    _persist_system_event(room_id, "room_settings", settings)
+    _audit_event("chat_room_approval_update", user_id=req.user_id, room_id=room_id, status="success", meta={"action": action, "target_user_id": target_user_id})
+
+    return {
+        "status": "ok",
+        "room_settings": {
+            "invite_policy": settings["invite_policy"],
+            "has_passcode": bool(settings.get("passcode_hash")),
+            "approved_count": len(settings.get("approved_user_ids") or []),
+        },
+    }
 
 
 @app.delete("/chat/rooms/{room_id}")
 async def delete_chat_room(room_id: str, req: ChatDeleteReq):
     room = _get_room_or_404(room_id)
     if room.get("creator_user_id") != req.user_id:
-        raise HTTPException(status_code=403, detail="Only the room creator can delete this room")
-    
-    # Delete from database
+        raise HTTPException(status_code=403, detail={"code": "ONLY_CREATOR", "message": "Only the room creator can delete this room"})
+
+    reason = (req.deletion_reason or "").strip() or "Deleted by the room owner"
+    tombstone = {
+        "room_id": room_id,
+        "deleted_at": _now_iso(),
+        "deleted_by": req.user_id,
+        "reason": reason,
+    }
+
+    # Keep a tombstone marker in the room stream so shared links return 410 with context.
     try:
-        supabase.table("chat_messages").delete().eq("room_id", room_id).execute()
+        _persist_system_event(room_id, "room_deleted", tombstone)
         supabase.table("chat_participants").delete().eq("room_id", room_id).execute()
-        supabase.table("chat_rooms").delete().eq("id", room_id).execute()
+        # Keep system events for tombstone/settings reconstruction; remove only user messages.
+        supabase.table("chat_messages").delete().eq("room_id", room_id).neq("author", CHAT_SYSTEM_AUTHOR).execute()
     except Exception:
         pass
-    
-    # Delete from memory
+
+    # Mark deleted in memory and remove active room caches.
+    CHAT_DELETED_ROOMS[room_id] = tombstone
     CHAT_ROOMS.pop(room_id, None)
-    return {"status": "deleted"}
+    CHAT_ROOM_SETTINGS.pop(room_id, None)
+    CHAT_ROOM_APPROVAL_REQUESTS.pop(room_id, None)
+    _audit_event("chat_room_delete", user_id=req.user_id, room_id=room_id, status="success", meta={"reason": reason})
+    return {"status": "deleted", "tombstone": tombstone}
 
 @app.delete("/vault/authenticator/{id}")
 async def del_auth(id: str):
@@ -868,21 +1546,99 @@ async def get_user_chat_rooms(user_id: str):
         
         # Get message counts and latest message
         all_rooms = {r["id"]: {**r, "message_count": 0, "latest_message_at": None} for r in created + participated}
+
+        # Hide rooms that were deleted (tombstoned).
+        active_room_ids = [rid for rid in all_rooms.keys() if not _build_tombstone(rid)]
         
-        for room_id in all_rooms.keys():
-            msg_count = supabase.table("chat_messages").select("id").eq("room_id", room_id).execute()
-            all_rooms[room_id]["message_count"] = len(msg_count.data or [])
+        for room_id in active_room_ids:
+            msg_count = supabase.table("chat_messages").select("id, author").eq("room_id", room_id).execute()
+            all_rooms[room_id]["message_count"] = len([m for m in (msg_count.data or []) if m.get("author") != CHAT_SYSTEM_AUTHOR])
             
-            latest = supabase.table("chat_messages").select("created_at").eq("room_id", room_id).order("created_at", desc=True).limit(1).execute()
+            latest = supabase.table("chat_messages").select("created_at").eq("room_id", room_id).neq("author", CHAT_SYSTEM_AUTHOR).order("created_at", desc=True).limit(1).execute()
             if latest.data:
                 all_rooms[room_id]["latest_message_at"] = latest.data[0]["created_at"]
         
         return {
-            "rooms": list(all_rooms.values()),
-            "count": len(all_rooms)
+            "rooms": [all_rooms[rid] for rid in active_room_ids],
+            "count": len(active_room_ids)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch chat rooms: {str(e)}")
+
+
+@app.get("/audit/user/{user_id}")
+async def get_user_audit_events(user_id: str, limit: int = 100):
+    cap = max(1, min(int(limit or 100), 500))
+    rows = [entry for entry in reversed(CHAT_AUDIT_LOGS) if entry.get("user_id") == user_id]
+    return {"events": rows[:cap], "count": min(len(rows), cap)}
+
+
+@app.post("/secrets/one-time")
+async def create_one_time_secret(req: OneTimeSecretCreateReq):
+    content = (req.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Secret note cannot be empty")
+    if len(content) > 8000:
+        raise HTTPException(status_code=400, detail="Secret note is too long")
+
+    expires_minutes = max(ONE_TIME_SECRET_MIN_MINUTES, min(int(req.expires_in_minutes or 30), ONE_TIME_SECRET_MAX_MINUTES))
+    now_dt = datetime.now(timezone.utc)
+    expires_dt = now_dt + timedelta(minutes=expires_minutes)
+    token = secrets.token_urlsafe(20)
+    ONE_TIME_SECRETS[token] = {
+        "token": token,
+        "created_by": req.user_id,
+        "content": _encrypt_text(content),
+        "created_at": now_dt.isoformat(),
+        "expires_at": expires_dt.isoformat(),
+        "expires_ts": expires_dt.timestamp(),
+        "consumed": False,
+    }
+    _audit_event(
+        "one_time_secret_create",
+        user_id=req.user_id,
+        status="success",
+        meta={"expires_in_minutes": expires_minutes},
+    )
+    _cleanup_one_time_secrets()
+    return {
+        "token": token,
+        "expires_at": expires_dt.isoformat(),
+        "link_path": f"/dashboard/secrets?secret={token}",
+    }
+
+
+@app.get("/secrets/one-time/{token}")
+async def consume_one_time_secret(token: str, user_id: str | None = None):
+    payload = ONE_TIME_SECRETS.get(token)
+    if not payload:
+        _cleanup_one_time_secrets()
+        raise HTTPException(status_code=404, detail="Secret note not found")
+
+    if bool(payload.get("consumed")):
+        ONE_TIME_SECRETS.pop(token, None)
+        raise HTTPException(status_code=410, detail="Secret note already opened")
+
+    if float(payload.get("expires_ts", 0)) <= time.time():
+        ONE_TIME_SECRETS.pop(token, None)
+        raise HTTPException(status_code=410, detail="Secret note expired")
+
+    payload["consumed"] = True
+    payload["consumed_at"] = _now_iso()
+    ONE_TIME_SECRETS.pop(token, None)
+    _audit_event(
+        "one_time_secret_read",
+        user_id=user_id or payload.get("created_by"),
+        status="success",
+        meta={"creator_user_id": payload.get("created_by")},
+    )
+    _cleanup_one_time_secrets()
+    return {
+        "content": _decrypt_text(payload.get("content")) or "",
+        "created_at": payload.get("created_at"),
+        "expires_at": payload.get("expires_at"),
+        "consumed_at": payload.get("consumed_at"),
+    }
 
 @app.get("/misc/security-quotes")
 async def security_quotes():
